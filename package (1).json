@@ -1,0 +1,16 @@
+{
+  "name": "re-bank-backend",
+  "version": "1.0.0",
+  "description": "RE国際銀行 バックエンドサーバー",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node server.js"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "cookie-parser": "^1.4.6",
+    "discord.js": "^14.14.1",
+    "express": "^4.18.2"
+  }
+}
