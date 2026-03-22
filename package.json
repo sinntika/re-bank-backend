@@ -2,7 +2,9 @@
   "name": "re-bank-backend",
   "version": "1.0.0",
   "main": "server.js",
-  "scripts": { "start": "node server.js" },
+  "scripts": {
+    "start": "node server.js"
+  },
   "dependencies": {
     "cors": "^2.8.5",
     "cookie-parser": "^1.4.6",
