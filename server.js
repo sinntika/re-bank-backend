@@ -1,6 +1,6 @@
 // ==========================================
-// RE国際銀行 バックエンド v4 (最終版)
-// 口座機能・RSD統一・担保50%・承認時金利開始
+// RE国際銀行 バックエンド v5
+// 日割り金利・預金金利元金ベース単利・%入力対応
 // ==========================================
 const express      = require('express');
 const cors         = require('cors');
@@ -55,29 +55,91 @@ app.use(express.json());
 app.use(cookieParser(C.COOKIE_SEC));
 
 // ==========================================
-// 金利計算（承認日時から計算）
+// 金利計算（承認日時から日割り計算）
+// 「○日で○%」→ 1日あたり (率÷日数) で毎日増える
 // ==========================================
 function calcInterest(loan) {
   if (!loan.approved_at) {
-    return { principal: loan.principal, interest: 0, total: loan.principal, remain: Math.max(0, loan.principal - (loan.paid_amount||0)), cycles: 0, deadlineDate: '未承認', overdue: false };
+    return {
+      principal: loan.principal, interest: 0, total: loan.principal,
+      remain: Math.max(0, loan.principal - (loan.paid_amount||0)),
+      elapsedDays: 0, dailyRate: 0, deadlineDate: '未承認', overdue: false,
+    };
   }
-  const isNat      = loan.loan_type === 'national';
-  const rate       = getSetting(isNat ? 'national_rate' : 'personal_rate', isNat ? 0.20 : 0.20);
-  const cycleDays  = getSetting(isNat ? 'national_cycle_days' : 'personal_cycle_days', isNat ? 30 : 10);
-  const deadDays   = getSetting(isNat ? 'national_deadline_days' : 'personal_deadline_days', isNat ? 365 : 180);
+  const isNat       = loan.loan_type === 'national';
+  const rate        = getSetting(isNat ? 'national_rate' : 'personal_rate', 0.20);
+  const cycleDays   = getSetting(isNat ? 'national_cycle_days' : 'personal_cycle_days', isNat ? 30 : 10);
+  const deadDays    = getSetting(isNat ? 'national_deadline_days' : 'personal_deadline_days', isNat ? 365 : 180);
 
-  const now        = Date.now();
-  const start      = new Date(loan.approved_at).getTime();
-  const elapsed    = (now - start) / 86400000;
-  const cycles     = Math.floor(elapsed / cycleDays);
-  const interest   = Math.floor(loan.principal * rate * cycles);
-  const total      = loan.principal + interest;
-  const remain     = Math.max(0, total - (loan.paid_amount || 0));
-  const extDays    = loan.deadline_extended || 0;
-  const deadlineMs = start + (deadDays + extDays) * 86400000;
+  const now         = Date.now();
+  const start       = new Date(loan.approved_at).getTime();
+  const elapsedDays = (now - start) / 86400000;
+
+  // 日割り：例「10日で20%」→ 1日で2% → dailyRate=0.02
+  const dailyRate = rate / cycleDays;
+  const interest  = Math.floor(loan.principal * dailyRate * elapsedDays);
+  const total     = loan.principal + interest;
+  const remain    = Math.max(0, total - (loan.paid_amount || 0));
+
+  const extDays      = loan.deadline_extended || 0;
+  const deadlineMs   = start + (deadDays + extDays) * 86400000;
   const deadlineDate = new Date(deadlineMs).toLocaleDateString('ja-JP');
-  const overdue    = now > deadlineMs && !['completed','rejected'].includes(loan.status);
-  return { principal: loan.principal, interest, total, remain, cycles, deadlineDate, overdue, rate, cycleDays };
+  const overdue      = now > deadlineMs && !['completed','rejected'].includes(loan.status);
+
+  return {
+    principal: loan.principal, interest, total, remain,
+    elapsedDays: Math.floor(elapsedDays), dailyRate, rate, cycleDays,
+    deadlineDate, overdue,
+  };
+}
+
+// ==========================================
+// 預金金利を適用（年1回・元金ベース単利）
+// 元金 = 残高 - 今までに追加した利息の累計
+// ==========================================
+async function applyDepositInterest(discordId) {
+  try {
+    const ar = await q(`SELECT * FROM accounts WHERE discord_id=$1`, [discordId]);
+    if (!ar.rows[0]) return;
+    const account = ar.rows[0];
+
+    const lastInterestAt = new Date(account.last_interest_at).getTime();
+    const now            = Date.now();
+    const oneYear        = 365 * 24 * 60 * 60 * 1000;
+
+    // 前回の金利適用から1年経っていない場合はスキップ
+    if (now - lastInterestAt < oneYear) return;
+
+    const rate         = getSetting('deposit_rate', 0.0002);
+    const balance      = Number(account.balance);
+    const interestPaid = Number(account.interest_paid || 0);
+
+    // 元金部分 = 残高 - 今まで増やした利息の累計
+    const principal = Math.max(0, balance - interestPaid);
+    const addAmount = Math.floor(principal * rate);
+    if (addAmount <= 0) return;
+
+    await q(
+      `UPDATE accounts SET balance=balance+$1, interest_paid=COALESCE(interest_paid,0)+$1, last_interest_at=NOW() WHERE discord_id=$2`,
+      [addAmount, discordId]
+    );
+
+    const txId = genId('TX');
+    await q(
+      `INSERT INTO transactions (id,from_discord_id,to_discord_id,amount,type,note) VALUES ($1,NULL,$2,$3,'interest','年次預金金利')`,
+      [txId, discordId, addAmount]
+    );
+
+    await pushNotice(discordId, {
+      title: '💰 預金金利が付きました',
+      body:  `元金 ${principal.toLocaleString()} RSD × ${(rate*100).toFixed(3)}% = ${addAmount.toLocaleString()} RSD が口座に追加されました。`,
+      color: 'green',
+    });
+
+    console.log(`預金金利適用: ${discordId} +${addAmount} RSD`);
+  } catch (e) {
+    console.error('預金金利エラー:', e.message);
+  }
 }
 
 // ── ヘルパー ──────────────────────────────
@@ -346,9 +408,12 @@ app.post('/api/auth/verify-token', async(req,res)=>{
   if(!token) return res.status(400).json({ok:false,error:'トークンがありません。'});
   const r = await q(`SELECT * FROM login_tokens WHERE token=$1 AND expires_at>NOW()`,[token]);
   if(!r.rows[0]) return res.status(401).json({ok:false,error:'URLが無効か期限切れです。'});
+  const discordId = r.rows[0].discord_id;
   await q(`DELETE FROM login_tokens WHERE token=$1`,[token]);
-  await createSession(res,r.rows[0].discord_id);
-  const ur = await q(`SELECT * FROM users WHERE discord_id=$1`,[r.rows[0].discord_id]);
+  await createSession(res, discordId);
+  // ログイン時に預金金利チェック（年1回自動適用）
+  applyDepositInterest(discordId).catch(()=>{});
+  const ur = await q(`SELECT * FROM users WHERE discord_id=$1`,[discordId]);
   res.json({ok:true,user:ur.rows[0]});
 });
 
@@ -526,10 +591,18 @@ app.get('/api/admin/settings', async(req,res)=>{
 app.post('/api/admin/settings', async(req,res)=>{
   if(!isAdmin(req)) return res.status(403).json({ok:false});
   const updates = req.body; // { key: value, ... }
+  // rate系のキーは%入力（例:2）→小数（0.02）に変換して保存
+  const rateKeys = ['personal_rate','national_rate','deposit_rate'];
   for(const [key,value] of Object.entries(updates)){
-    await q(`INSERT INTO settings (key,value,updated_at) VALUES ($1,$2,NOW()) ON CONFLICT (key) DO UPDATE SET value=$2, updated_at=NOW()`,[key,String(value)]);
+    let saveVal = String(value);
+    if(rateKeys.includes(key)){
+      // 1より大きい値は%として入力されたとみなし÷100する
+      const num = Number(value);
+      saveVal = (num > 1 ? (num / 100) : num).toFixed(6);
+    }
+    await q(`INSERT INTO settings (key,value,updated_at) VALUES ($1,$2,NOW()) ON CONFLICT (key) DO UPDATE SET value=$2, updated_at=NOW()`,[key,saveVal]);
   }
-  await loadSettings(); // キャッシュ更新
+  await loadSettings();
   res.json({ok:true,settings:settingsCache});
 });
 
